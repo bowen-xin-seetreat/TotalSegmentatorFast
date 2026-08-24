@@ -6,6 +6,7 @@ import time
 import platform
 import shutil
 import subprocess
+import itertools
 from pathlib import Path
 from os.path import join
 from typing import Union
@@ -70,8 +71,16 @@ patch_nnunet_cropped_logits_resampling()
 #     from nnunetv2.inference.predict_from_raw_data import predict_from_raw_data
 # nnUNet 2.2
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
 
 from nnunetv2.utilities.file_path_utilities import get_output_folder
+
+try:
+    import openvino as ov
+    import openvino.properties.hint as ov_hints
+except ImportError:
+    ov = None
+    ov_hints = None
 
 from totalsegmentator.map_to_binary import class_map, class_map_5_parts, class_map_5_parts_total_v3, class_map_parts_mr, class_map_parts_headneck_muscles
 from totalsegmentator.map_to_binary import map_taskid_to_partname_mr, map_taskid_to_partname_ct, map_taskid_to_partname_ct_v3, map_taskid_to_partname_headneck_muscles
@@ -212,6 +221,94 @@ def nnUNet_predict(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
                         step_size=step_size, checkpoint_name=chk)
 
 
+# Process-wide cache of compiled OpenVINO models, keyed by (ir_path, device).
+_OV_COMPILED_MODEL_CACHE = {}
+
+
+class OpenVINOnnUNetPredictor(nnUNetPredictor):
+    """nnUNetPredictor variant that runs inference through a compiled OpenVINO model."""
+
+    def __init__(self, *args, ov_device="CPU", **kwargs):
+        if ov is None:
+            raise ImportError(
+                "openvino is not installed. Install it (e.g. `pip install openvino`) "
+                "to use device='openvino'."
+            )
+        kwargs["device"] = torch.device("cpu")
+        super().__init__(*args, **kwargs)
+        self.ov_device = ov_device
+        self.ov_compiled_model = None
+
+    def initialize_from_trained_model_folder(self,
+                                            model_training_output_dir: str,
+                                            use_folds,
+                                            checkpoint_name: str = "checkpoint_final.pth"):
+        if use_folds is None:
+            use_folds = nnUNetPredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
+        if isinstance(use_folds, str):
+            use_folds = [use_folds]
+        assert len(use_folds) == 1, "OpenVINO inference only supports a single fold."
+
+        super().initialize_from_trained_model_folder(model_training_output_dir, use_folds, checkpoint_name)
+        self.network.eval()
+
+        fold = use_folds[0]
+        ov_model_path = Path(model_training_output_dir) / f"fold_{fold}" / f"{checkpoint_name}.openvino.xml"
+
+        cache_key = (str(ov_model_path), self.ov_device)
+        cached_model = _OV_COMPILED_MODEL_CACHE.get(cache_key)
+        if cached_model is not None:
+            self.ov_compiled_model = cached_model
+            return
+
+        core = ov.Core()
+        if ov_model_path.exists():
+            ov_model = core.read_model(str(ov_model_path))
+        else:
+            example_input = torch.rand(
+                1,
+                determine_num_input_channels(
+                    self.plans_manager, self.configuration_manager, self.dataset_json
+                ),
+                *self.configuration_manager.patch_size,
+            )
+            with torch.no_grad():
+                ov_model = ov.convert_model(self.network, example_input=example_input)
+            ov_model_path.parent.mkdir(parents=True, exist_ok=True)
+            ov.save_model(ov_model, str(ov_model_path))
+
+        config = {}
+        if ov_hints is not None:
+            config = {ov_hints.performance_mode: ov_hints.PerformanceMode.LATENCY}
+        self.ov_compiled_model = core.compile_model(ov_model, self.ov_device, config=config)
+        _OV_COMPILED_MODEL_CACHE[cache_key] = self.ov_compiled_model
+
+    def predict_logits_from_preprocessed_data(self, data: torch.Tensor) -> torch.Tensor:
+        prediction = self.predict_sliding_window_return_logits(data)
+        if self.verbose:
+            print("Prediction done")
+        return prediction
+
+    @torch.inference_mode()
+    def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
+        mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
+        prediction = torch.from_numpy(self.ov_compiled_model(x)[0])
+
+        if mirror_axes is not None:
+            assert max(mirror_axes) <= x.ndim - 3, "mirror_axes does not match the dimension of the input!"
+            mirror_axes = [m + 2 for m in mirror_axes]
+            axes_combinations = [
+                c
+                for i in range(len(mirror_axes))
+                for c in itertools.combinations(mirror_axes, i + 1)
+            ]
+            for axes in axes_combinations:
+                flipped = torch.from_numpy(self.ov_compiled_model(torch.flip(x, axes))[0])
+                prediction += torch.flip(flipped, axes)
+            prediction /= len(axes_combinations) + 1
+        return prediction
+
+
 def nnUNetv2_predict(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
                      trainer="nnUNetTrainer", tta=False,
                      num_threads_preprocessing=3, num_threads_nifti_save=2,
@@ -228,23 +325,32 @@ def nnUNetv2_predict(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
 
     model_folder = get_output_folder(task_id, trainer, plans, model)
 
-    assert device in ['cpu', 'cuda',
-                           'mps'] or isinstance(device, torch.device), f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {device}.'
-    if device == 'cpu':
-        # let's allow torch to use hella threads
+    is_openvino = isinstance(device, str) and device.startswith("openvino")
+    ov_device = "CPU"
+    if is_openvino:
+        if ":" in device:
+            ov_device = device.split(":", 1)[1].upper()
         import multiprocessing
         torch.set_num_threads(multiprocessing.cpu_count())
-        device = torch.device('cpu')
-    elif device == 'cuda':
-        # multithreading in torch doesn't help nnU-Net if run on GPU
-        torch.set_num_threads(1)
-        # torch.set_num_interop_threads(1)  # throws error if setting the second time
-        device = torch.device('cuda')
-    elif isinstance(device, torch.device):
-        torch.set_num_threads(1)
-        device = device
+        device = torch.device("cpu")
     else:
-        device = torch.device('mps')
+        assert device in ['cpu', 'cuda',
+                               'mps'] or isinstance(device, torch.device), f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {device}.'
+        if device == 'cpu':
+            # let's allow torch to use hella threads
+            import multiprocessing
+            torch.set_num_threads(multiprocessing.cpu_count())
+            device = torch.device('cpu')
+        elif device == 'cuda':
+            # multithreading in torch doesn't help nnU-Net if run on GPU
+            torch.set_num_threads(1)
+            # torch.set_num_interop_threads(1)  # throws error if setting the second time
+            device = torch.device('cuda')
+        elif isinstance(device, torch.device):
+            torch.set_num_threads(1)
+            device = device
+        else:
+            device = torch.device('mps')
     disable_tta = not tta
     verbose = False
     if save_probabilities_path is None:
@@ -281,7 +387,17 @@ def nnUNetv2_predict(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
     #                       device=device)
 
     # nnUNet 2.2.1
-    if supports_keyword_argument(nnUNetPredictor, "perform_everything_on_gpu"):
+    if is_openvino:
+        predictor = OpenVINOnnUNetPredictor(
+            tile_step_size=step_size,
+            use_gaussian=True,
+            use_mirroring=not disable_tta,
+            verbose=verbose,
+            verbose_preprocessing=verbose,
+            allow_tqdm=allow_tqdm,
+            ov_device=ov_device
+        )
+    elif supports_keyword_argument(nnUNetPredictor, "perform_everything_on_gpu"):
         predictor = nnUNetPredictor(
             tile_step_size=step_size,
             use_gaussian=True,

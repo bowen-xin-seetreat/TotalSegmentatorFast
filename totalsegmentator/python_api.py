@@ -24,7 +24,7 @@ import re
 
 
 def validate_device_type_api(value):
-    valid_strings = ["gpu", "cpu", "mps"]
+    valid_strings = ["gpu", "cpu", "mps", "openvino", "openvino:cpu"]
     if value in valid_strings:
         return value
 
@@ -35,12 +35,19 @@ def validate_device_type_api(value):
         device_id = int(match.group(1))
         return value
 
+    # OpenVINO backends are configured with an explicit CPU/GPU target when needed.
+    openvino_pattern = r"^openvino:(cpu|gpu)$"
+    if re.match(openvino_pattern, value):
+        return value
+
     raise ValueError(
-        f"Invalid device type: '{value}'. Must be 'gpu', 'cpu', 'mps', or 'gpu:X' where X is an integer representing the GPU device ID.")
+        f"Invalid device type: '{value}'. Must be 'gpu', 'cpu', 'mps', 'openvino', 'openvino:cpu', 'openvino:gpu', or 'gpu:X' where X is an integer representing the GPU device ID.")
 
 
 def convert_device_to_cuda(device):
-    if device in ["cpu", "mps", "gpu"]:
+    if device in ["cpu", "mps", "gpu", "openvino", "openvino:cpu", "openvino:gpu"]:
+        return device
+    elif str(device).startswith("openvino:"):
         return device
     else:  # gpu:X
         return f"cuda:{device.split(':')[1]}"
@@ -52,9 +59,14 @@ def convert_device_to_string(device):
             return "gpu"
         else:
             return device.type
+    if str(device).startswith("openvino"):
+        return "openvino"
 
 
 def select_device(device):
+    if str(device).startswith("openvino"):
+        return str(device)
+
     device = convert_device_to_cuda(device)
 
     # available devices: gpu | cpu | mps | gpu:1, gpu:2, etc.

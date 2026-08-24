@@ -24,7 +24,7 @@ import re
 
 
 def validate_device_type_api(value):
-    valid_strings = ["gpu", "cpu", "mps", "openvino", "openvino:cpu"]
+    valid_strings = ["gpu", "cpu", "mps", "openvino", "openvino:cpu", "openvino_int8", "openvino_int8:cpu"]
     if value in valid_strings:
         return value
 
@@ -36,12 +36,14 @@ def validate_device_type_api(value):
         return value
 
     # OpenVINO backends are configured with an explicit CPU/GPU target when needed.
-    openvino_pattern = r"^openvino:(cpu|gpu)$"
+    # "openvino_int8" selects the NNCF INT8-quantized IR instead of plain FP32.
+    openvino_pattern = r"^openvino(_int8)?:(cpu|gpu)$"
     if re.match(openvino_pattern, value):
         return value
 
     raise ValueError(
-        f"Invalid device type: '{value}'. Must be 'gpu', 'cpu', 'mps', 'openvino', 'openvino:cpu', 'openvino:gpu', or 'gpu:X' where X is an integer representing the GPU device ID.")
+        f"Invalid device type: '{value}'. Must be 'gpu', 'cpu', 'mps', 'openvino', 'openvino:cpu', 'openvino:gpu', "
+        f"'openvino_int8', 'openvino_int8:cpu', 'openvino_int8:gpu', or 'gpu:X' where X is an integer representing the GPU device ID.")
 
 
 def convert_device_to_cuda(device):
@@ -60,7 +62,7 @@ def convert_device_to_string(device):
         else:
             return device.type
     if str(device).startswith("openvino"):
-        return "openvino"
+        return str(device)
 
 
 def select_device(device):

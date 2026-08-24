@@ -82,6 +82,11 @@ except ImportError:
     ov = None
     ov_hints = None
 
+try:
+    import nncf
+except ImportError:
+    nncf = None
+
 from totalsegmentator.map_to_binary import class_map, class_map_5_parts, class_map_5_parts_total_v3, class_map_parts_mr, class_map_parts_headneck_muscles
 from totalsegmentator.map_to_binary import map_taskid_to_partname_mr, map_taskid_to_partname_ct, map_taskid_to_partname_ct_v3, map_taskid_to_partname_headneck_muscles
 from totalsegmentator.alignment import as_closest_canonical_nifti, undo_canonical_nifti
@@ -228,16 +233,58 @@ _OV_COMPILED_MODEL_CACHE = {}
 class OpenVINOnnUNetPredictor(nnUNetPredictor):
     """nnUNetPredictor variant that runs inference through a compiled OpenVINO model."""
 
-    def __init__(self, *args, ov_device="CPU", **kwargs):
+    #: Cap on how many real sliding-window patches from the first prediction
+    #: call are used to calibrate INT8 quantization (only when ov_quantize=True
+    #: and neither a cached INT8 IR nor explicit ov_calibration_data exist).
+    _MAX_LAZY_CALIBRATION_PATCHES = 32
+
+    def __init__(self, *args, ov_device="CPU", ov_quantize=False, ov_calibration_data=None, **kwargs):
         if ov is None:
             raise ImportError(
                 "openvino is not installed. Install it (e.g. `pip install openvino`) "
                 "to use device='openvino'."
             )
+        if ov_quantize and nncf is None:
+            raise ImportError(
+                "nncf is not installed. Install it (e.g. `pip install nncf`) "
+                "to use device='openvino_int8'."
+            )
         kwargs["device"] = torch.device("cpu")
         super().__init__(*args, **kwargs)
         self.ov_device = ov_device
+        self.ov_quantize = ov_quantize
+        # Real preprocessed patches for calibration, if the caller already has
+        # them. If not (the common case), quantization is deferred until real
+        # sliding-window patches are seen from the first prediction call (see
+        # _internal_maybe_mirror_and_predict / _finalize_pending_int8_quantization)
+        # instead of calibrating against synthetic random noise.
+        self.ov_calibration_data = ov_calibration_data
         self.ov_compiled_model = None
+        self._pending_int8 = None
+
+    def _compile(self, ov_model):
+        config = {}
+        if ov_hints is not None:
+            config = {ov_hints.performance_mode: ov_hints.PerformanceMode.LATENCY}
+        # Experimental knob: cap this compiled model's own thread pool so several
+        # OpenVINO models (e.g. the "total" task's organ/vertebrae/muscle parts)
+        # can run concurrently without oversubscribing the CPU. Unset by default
+        # (each model uses OpenVINO's own auto-detected thread count).
+        num_threads = os.environ.get("TOTALSEG_OV_NUM_THREADS")
+        if num_threads is not None:
+            import openvino.properties as ov_props
+            config[ov_props.inference_num_threads] = int(num_threads)
+        return ov.Core().compile_model(ov_model, self.ov_device, config=config)
+
+
+    def _quantize_and_compile(self, ov_model, calibration_patches, ir_path):
+        calibration_dataset = nncf.Dataset(
+            [patch.numpy() if torch.is_tensor(patch) else patch for patch in calibration_patches]
+        )
+        ov_model = nncf.quantize(ov_model, calibration_dataset)
+        ir_path.parent.mkdir(parents=True, exist_ok=True)
+        ov.save_model(ov_model, str(ir_path))
+        return self._compile(ov_model)
 
     def initialize_from_trained_model_folder(self,
                                             model_training_output_dir: str,
@@ -253,7 +300,9 @@ class OpenVINOnnUNetPredictor(nnUNetPredictor):
         self.network.eval()
 
         fold = use_folds[0]
-        ov_model_path = Path(model_training_output_dir) / f"fold_{fold}" / f"{checkpoint_name}.openvino.xml"
+        fold_dir = Path(model_training_output_dir) / f"fold_{fold}"
+        ir_suffix = "openvino_int8" if self.ov_quantize else "openvino"
+        ov_model_path = fold_dir / f"{checkpoint_name}.{ir_suffix}.xml"
 
         cache_key = (str(ov_model_path), self.ov_device)
         cached_model = _OV_COMPILED_MODEL_CACHE.get(cache_key)
@@ -263,34 +312,70 @@ class OpenVINOnnUNetPredictor(nnUNetPredictor):
 
         core = ov.Core()
         if ov_model_path.exists():
-            ov_model = core.read_model(str(ov_model_path))
-        else:
-            example_input = torch.rand(
-                1,
-                determine_num_input_channels(
-                    self.plans_manager, self.configuration_manager, self.dataset_json
-                ),
-                *self.configuration_manager.patch_size,
-            )
-            with torch.no_grad():
-                ov_model = ov.convert_model(self.network, example_input=example_input)
-            ov_model_path.parent.mkdir(parents=True, exist_ok=True)
-            ov.save_model(ov_model, str(ov_model_path))
+            self.ov_compiled_model = self._compile(core.read_model(str(ov_model_path)))
+            _OV_COMPILED_MODEL_CACHE[cache_key] = self.ov_compiled_model
+            return
 
-        config = {}
-        if ov_hints is not None:
-            config = {ov_hints.performance_mode: ov_hints.PerformanceMode.LATENCY}
-        self.ov_compiled_model = core.compile_model(ov_model, self.ov_device, config=config)
-        _OV_COMPILED_MODEL_CACHE[cache_key] = self.ov_compiled_model
+        example_input = torch.rand(
+            1,
+            determine_num_input_channels(
+                self.plans_manager, self.configuration_manager, self.dataset_json
+            ),
+            *self.configuration_manager.patch_size,
+        )
+        with torch.no_grad():
+            fp32_ov_model = ov.convert_model(self.network, example_input=example_input)
+
+        if not self.ov_quantize:
+            ov_model_path.parent.mkdir(parents=True, exist_ok=True)
+            ov.save_model(fp32_ov_model, str(ov_model_path))
+            self.ov_compiled_model = self._compile(fp32_ov_model)
+            _OV_COMPILED_MODEL_CACHE[cache_key] = self.ov_compiled_model
+            return
+
+        if self.ov_calibration_data:
+            self.ov_compiled_model = self._quantize_and_compile(
+                fp32_ov_model, self.ov_calibration_data, ov_model_path
+            )
+            _OV_COMPILED_MODEL_CACHE[cache_key] = self.ov_compiled_model
+            return
+
+        # No cached INT8 IR and no explicit calibration data: run FP32 for now
+        # and lazily collect real sliding-window patches from the first
+        # prediction call (see _internal_maybe_mirror_and_predict) to calibrate
+        # INT8 quantization once that call finishes.
+        self.ov_compiled_model = self._compile(fp32_ov_model)
+        self._pending_int8 = {
+            "fp32_ov_model": fp32_ov_model,
+            "ir_path": ov_model_path,
+            "cache_key": cache_key,
+            "patches": [],
+        }
+
+    def _finalize_pending_int8_quantization(self):
+        pending = self._pending_int8
+        if pending is None or not pending["patches"]:
+            return
+        if self.verbose:
+            print(f"Quantizing to INT8 using {len(pending['patches'])} real preprocessed patches...")
+        self.ov_compiled_model = self._quantize_and_compile(
+            pending["fp32_ov_model"], pending["patches"], pending["ir_path"]
+        )
+        _OV_COMPILED_MODEL_CACHE[pending["cache_key"]] = self.ov_compiled_model
+        self._pending_int8 = None
 
     def predict_logits_from_preprocessed_data(self, data: torch.Tensor) -> torch.Tensor:
         prediction = self.predict_sliding_window_return_logits(data)
+        self._finalize_pending_int8_quantization()
         if self.verbose:
             print("Prediction done")
         return prediction
 
     @torch.inference_mode()
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
+        if self._pending_int8 is not None and len(self._pending_int8["patches"]) < self._MAX_LAZY_CALIBRATION_PATCHES:
+            self._pending_int8["patches"].append(x.detach().clone())
+
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
         prediction = torch.from_numpy(self.ov_compiled_model(x)[0])
 
@@ -326,10 +411,14 @@ def nnUNetv2_predict(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
     model_folder = get_output_folder(task_id, trainer, plans, model)
 
     is_openvino = isinstance(device, str) and device.startswith("openvino")
+    # "openvino_int8" / "openvino_int8:GPU" selects the NNCF-quantized IR instead
+    # of the plain FP32 conversion, cached under a separate .openvino_int8.xml file.
+    ov_quantize = isinstance(device, str) and device.startswith("openvino_int8")
     ov_device = "CPU"
     if is_openvino:
-        if ":" in device:
-            ov_device = device.split(":", 1)[1].upper()
+        device_suffix = device[len("openvino_int8"):] if ov_quantize else device[len("openvino"):]
+        if device_suffix.startswith(":"):
+            ov_device = device_suffix[1:].upper()
         import multiprocessing
         torch.set_num_threads(multiprocessing.cpu_count())
         device = torch.device("cpu")
@@ -395,7 +484,8 @@ def nnUNetv2_predict(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
             verbose=verbose,
             verbose_preprocessing=verbose,
             allow_tqdm=allow_tqdm,
-            ov_device=ov_device
+            ov_device=ov_device,
+            ov_quantize=ov_quantize,
         )
     elif supports_keyword_argument(nnUNetPredictor, "perform_everything_on_gpu"):
         predictor = nnUNetPredictor(

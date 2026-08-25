@@ -238,7 +238,8 @@ class OpenVINOnnUNetPredictor(nnUNetPredictor):
     #: and neither a cached INT8 IR nor explicit ov_calibration_data exist).
     _MAX_LAZY_CALIBRATION_PATCHES = 32
 
-    def __init__(self, *args, ov_device="CPU", ov_quantize=False, ov_calibration_data=None, **kwargs):
+    def __init__(self, *args, ov_device="CPU", ov_quantize=False, ov_calibration_data=None,
+                 ov_use_async_api=False, **kwargs):
         if ov is None:
             raise ImportError(
                 "openvino is not installed. Install it (e.g. `pip install openvino`) "
@@ -259,7 +260,18 @@ class OpenVINOnnUNetPredictor(nnUNetPredictor):
         # _internal_maybe_mirror_and_predict / _finalize_pending_int8_quantization)
         # instead of calibrating against synthetic random noise.
         self.ov_calibration_data = ov_calibration_data
+        # Route each patch through InferRequest.start_async()/.wait() instead of
+        # CompiledModel.__call__(). Both release the GIL for the duration of the
+        # native inference call, so this is only expected to differ from the
+        # synchronous path when calls can be pipelined (submit patch N+1 before
+        # waiting on patch N) -- which this predictor does NOT do, since the
+        # surrounding sliding-window loop (in the base nnUNetPredictor) requests
+        # one patch at a time and blocks on its result before asking for the
+        # next. Kept as an explicit, measurable comparison point rather than
+        # assumed to be faster.
+        self.ov_use_async_api = ov_use_async_api
         self.ov_compiled_model = None
+        self._ov_infer_request = None
         self._pending_int8 = None
 
     def _compile(self, ov_model):
@@ -372,12 +384,23 @@ class OpenVINOnnUNetPredictor(nnUNetPredictor):
         return prediction
 
     @torch.inference_mode()
+    def _infer(self, x: torch.Tensor):
+        """Run one patch through the compiled model, sync or via the async API."""
+        if not self.ov_use_async_api:
+            return self.ov_compiled_model(x)[0]
+        if self._ov_infer_request is None:
+            self._ov_infer_request = self.ov_compiled_model.create_infer_request()
+        self._ov_infer_request.start_async(x)
+        self._ov_infer_request.wait()
+        return self._ov_infer_request.get_output_tensor(0).data
+
+    @torch.inference_mode()
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
         if self._pending_int8 is not None and len(self._pending_int8["patches"]) < self._MAX_LAZY_CALIBRATION_PATCHES:
             self._pending_int8["patches"].append(x.detach().clone())
 
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
-        prediction = torch.from_numpy(self.ov_compiled_model(x)[0])
+        prediction = torch.from_numpy(self._infer(x))
 
         if mirror_axes is not None:
             assert max(mirror_axes) <= x.ndim - 3, "mirror_axes does not match the dimension of the input!"
@@ -388,7 +411,7 @@ class OpenVINOnnUNetPredictor(nnUNetPredictor):
                 for c in itertools.combinations(mirror_axes, i + 1)
             ]
             for axes in axes_combinations:
-                flipped = torch.from_numpy(self.ov_compiled_model(torch.flip(x, axes))[0])
+                flipped = torch.from_numpy(self._infer(torch.flip(x, axes)))
                 prediction += torch.flip(flipped, axes)
             prediction /= len(axes_combinations) + 1
         return prediction
@@ -411,14 +434,22 @@ def nnUNetv2_predict(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
     model_folder = get_output_folder(task_id, trainer, plans, model)
 
     is_openvino = isinstance(device, str) and device.startswith("openvino")
-    # "openvino_int8" / "openvino_int8:GPU" selects the NNCF-quantized IR instead
-    # of the plain FP32 conversion, cached under a separate .openvino_int8.xml file.
-    ov_quantize = isinstance(device, str) and device.startswith("openvino_int8")
+    # Device strings look like "openvino[_int8][_async][:cpu|:gpu]" -- flags
+    # after the "openvino" prefix combine freely (e.g. "openvino_int8_async").
+    # "int8" selects the NNCF-quantized IR (cached separately as .openvino_int8.xml);
+    # "async" routes inference through InferRequest.start_async()/.wait() instead
+    # of CompiledModel.__call__() (see OpenVINOnnUNetPredictor._infer).
     ov_device = "CPU"
+    ov_quantize = False
+    ov_use_async_api = False
     if is_openvino:
-        device_suffix = device[len("openvino_int8"):] if ov_quantize else device[len("openvino"):]
-        if device_suffix.startswith(":"):
-            ov_device = device_suffix[1:].upper()
+        device_body = device
+        if ":" in device_body:
+            device_body, ov_device_suffix = device_body.split(":", 1)
+            ov_device = ov_device_suffix.upper()
+        ov_flags = device_body[len("openvino"):].strip("_").split("_") if device_body != "openvino" else []
+        ov_quantize = "int8" in ov_flags
+        ov_use_async_api = "async" in ov_flags
         import multiprocessing
         torch.set_num_threads(multiprocessing.cpu_count())
         device = torch.device("cpu")
@@ -486,6 +517,7 @@ def nnUNetv2_predict(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
             allow_tqdm=allow_tqdm,
             ov_device=ov_device,
             ov_quantize=ov_quantize,
+            ov_use_async_api=ov_use_async_api,
         )
     elif supports_keyword_argument(nnUNetPredictor, "perform_everything_on_gpu"):
         predictor = nnUNetPredictor(

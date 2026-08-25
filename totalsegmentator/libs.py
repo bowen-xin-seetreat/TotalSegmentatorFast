@@ -7,6 +7,7 @@ import json
 import time
 import string
 import shutil
+import threading
 import zipfile
 from pathlib import Path
 
@@ -28,17 +29,37 @@ class DummyFile:
     def write(self, x): pass
     def flush(self): pass
 
+# nostdout() below swaps the process-global sys.stdout, which is not safe if
+# multiple threads each call it concurrently (e.g. running two OpenVINO
+# segmentations at once): whichever thread's "with" block exits last would
+# restore sys.stdout to whatever it saw on entry -- possibly another thread's
+# DummyFile -- permanently silencing print() for the rest of the process.
+# Track how many callers are currently suppressing stdout so only the first-in
+# swaps it out and only the last-out restores it, guarded by a lock so the
+# increment/decrement itself can't race.
+_nostdout_lock = threading.Lock()
+_nostdout_depth = 0
+_nostdout_saved_stdout = None
+
 @contextlib.contextmanager
 def nostdout(verbose=False):
-    if not verbose:
-        save_stdout = sys.stdout
-        sys.stdout = DummyFile()
-        try:
-            yield
-        finally:
-            sys.stdout = save_stdout
-    else:
+    global _nostdout_depth, _nostdout_saved_stdout
+    if verbose:
         yield
+        return
+    with _nostdout_lock:
+        if _nostdout_depth == 0:
+            _nostdout_saved_stdout = sys.stdout
+            sys.stdout = DummyFile()
+        _nostdout_depth += 1
+    try:
+        yield
+    finally:
+        with _nostdout_lock:
+            _nostdout_depth -= 1
+            if _nostdout_depth == 0:
+                sys.stdout = _nostdout_saved_stdout
+                _nostdout_saved_stdout = None
 
 
 def robust_rmtree(path, max_retries=3, delay=0.5):

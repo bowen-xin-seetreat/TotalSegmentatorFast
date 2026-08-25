@@ -24,7 +24,7 @@ import re
 
 
 def validate_device_type_api(value):
-    valid_strings = ["gpu", "cpu", "mps", "openvino", "openvino:cpu", "openvino_int8", "openvino_int8:cpu"]
+    valid_strings = ["gpu", "cpu", "mps", "openvino", "openvino:cpu"]
     if value in valid_strings:
         return value
 
@@ -35,15 +35,17 @@ def validate_device_type_api(value):
         device_id = int(match.group(1))
         return value
 
-    # OpenVINO backends are configured with an explicit CPU/GPU target when needed.
-    # "openvino_int8" selects the NNCF INT8-quantized IR instead of plain FP32.
-    openvino_pattern = r"^openvino(_int8)?:(cpu|gpu)$"
+    # OpenVINO backends: "openvino[_int8][_async][:cpu|:gpu]". "int8" selects the
+    # NNCF-quantized IR instead of plain FP32; "async" routes inference through
+    # InferRequest.start_async()/.wait(); the two flags combine freely.
+    openvino_pattern = r"^openvino(_int8)?(_async)?(:(cpu|gpu))?$"
     if re.match(openvino_pattern, value):
         return value
 
     raise ValueError(
-        f"Invalid device type: '{value}'. Must be 'gpu', 'cpu', 'mps', 'openvino', 'openvino:cpu', 'openvino:gpu', "
-        f"'openvino_int8', 'openvino_int8:cpu', 'openvino_int8:gpu', or 'gpu:X' where X is an integer representing the GPU device ID.")
+        f"Invalid device type: '{value}'. Must be 'gpu', 'cpu', 'mps', 'openvino' (optionally with '_int8' and/or "
+        f"'_async' suffixes, and an optional ':cpu'/':gpu' target), or 'gpu:X' where X is an integer representing "
+        f"the GPU device ID.")
 
 
 def convert_device_to_cuda(device):

@@ -238,8 +238,7 @@ class OpenVINOnnUNetPredictor(nnUNetPredictor):
     #: and neither a cached INT8 IR nor explicit ov_calibration_data exist).
     _MAX_LAZY_CALIBRATION_PATCHES = 32
 
-    def __init__(self, *args, ov_device="CPU", ov_quantize=False, ov_calibration_data=None,
-                 ov_use_async_api=False, **kwargs):
+    def __init__(self, *args, ov_device="CPU", ov_quantize=False, ov_calibration_data=None, **kwargs):
         if ov is None:
             raise ImportError(
                 "openvino is not installed. Install it (e.g. `pip install openvino`) "
@@ -260,18 +259,7 @@ class OpenVINOnnUNetPredictor(nnUNetPredictor):
         # _internal_maybe_mirror_and_predict / _finalize_pending_int8_quantization)
         # instead of calibrating against synthetic random noise.
         self.ov_calibration_data = ov_calibration_data
-        # Route each patch through InferRequest.start_async()/.wait() instead of
-        # CompiledModel.__call__(). Both release the GIL for the duration of the
-        # native inference call, so this is only expected to differ from the
-        # synchronous path when calls can be pipelined (submit patch N+1 before
-        # waiting on patch N) -- which this predictor does NOT do, since the
-        # surrounding sliding-window loop (in the base nnUNetPredictor) requests
-        # one patch at a time and blocks on its result before asking for the
-        # next. Kept as an explicit, measurable comparison point rather than
-        # assumed to be faster.
-        self.ov_use_async_api = ov_use_async_api
         self.ov_compiled_model = None
-        self._ov_infer_request = None
         self._pending_int8 = None
 
     def _compile(self, ov_model):
@@ -385,14 +373,16 @@ class OpenVINOnnUNetPredictor(nnUNetPredictor):
 
     @torch.inference_mode()
     def _infer(self, x: torch.Tensor):
-        """Run one patch through the compiled model, sync or via the async API."""
-        if not self.ov_use_async_api:
-            return self.ov_compiled_model(x)[0]
-        if self._ov_infer_request is None:
-            self._ov_infer_request = self.ov_compiled_model.create_infer_request()
-        self._ov_infer_request.start_async(x)
-        self._ov_infer_request.wait()
-        return self._ov_infer_request.get_output_tensor(0).data
+        """Run one patch through the compiled OpenVINO model.
+
+        Create a fresh infer request for each patch so a shared predictor object
+        can be used safely from multiple threads without racing on an InferRequest
+        that is already busy from another call.
+        """
+        infer_request = self.ov_compiled_model.create_infer_request()
+        infer_request.start_async(x)
+        infer_request.wait()
+        return infer_request.get_output_tensor(0).data
 
     @torch.inference_mode()
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
@@ -434,22 +424,22 @@ def nnUNetv2_predict(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
     model_folder = get_output_folder(task_id, trainer, plans, model)
 
     is_openvino = isinstance(device, str) and device.startswith("openvino")
-    # Device strings look like "openvino[_int8][_async][:cpu|:gpu]" -- flags
-    # after the "openvino" prefix combine freely (e.g. "openvino_int8_async").
-    # "int8" selects the NNCF-quantized IR (cached separately as .openvino_int8.xml);
-    # "async" routes inference through InferRequest.start_async()/.wait() instead
-    # of CompiledModel.__call__() (see OpenVINOnnUNetPredictor._infer).
+    # Device strings look like "openvino[_int8][:cpu|:gpu]". The "int8" flag
+    # selects the NNCF-quantized IR (cached separately as .openvino_int8.xml);
+    # the async variant is intentionally omitted to keep this in line with the
+    # upstream TotalSegmentator API and the fact that the sliding-window loop
+    # executes one patch at a time and does not benefit from async pipelining.
     ov_device = "CPU"
     ov_quantize = False
-    ov_use_async_api = False
     if is_openvino:
         device_body = device
         if ":" in device_body:
             device_body, ov_device_suffix = device_body.split(":", 1)
             ov_device = ov_device_suffix.upper()
         ov_flags = device_body[len("openvino"):].strip("_").split("_") if device_body != "openvino" else []
+        if "async" in ov_flags:
+            raise ValueError("Async OpenVINO device strings are not supported; use 'openvino' or 'openvino_int8'.")
         ov_quantize = "int8" in ov_flags
-        ov_use_async_api = "async" in ov_flags
         import multiprocessing
         torch.set_num_threads(multiprocessing.cpu_count())
         device = torch.device("cpu")
@@ -517,7 +507,6 @@ def nnUNetv2_predict(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
             allow_tqdm=allow_tqdm,
             ov_device=ov_device,
             ov_quantize=ov_quantize,
-            ov_use_async_api=ov_use_async_api,
         )
     elif supports_keyword_argument(nnUNetPredictor, "perform_everything_on_gpu"):
         predictor = nnUNetPredictor(

@@ -424,7 +424,7 @@ def nnUNetv2_predict(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
     model_folder = get_output_folder(task_id, trainer, plans, model)
 
     is_openvino = isinstance(device, str) and device.startswith("openvino")
-    # Device strings look like "openvino[_int8][:cpu|:gpu]". The "int8" flag
+    # Device strings look like "openvino[_int8][:cpu]". The "int8" flag
     # selects the NNCF-quantized IR (cached separately as .openvino_int8.xml);
     # the async variant is intentionally omitted to keep this in line with the
     # upstream TotalSegmentator API and the fact that the sliding-window loop

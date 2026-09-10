@@ -13,7 +13,6 @@ class TestValidateDeviceType(unittest.TestCase):
         self.assertEqual(validate_device_type("openvino"), "openvino")
         self.assertEqual(validate_device_type("openvino_int8"), "openvino_int8")
         self.assertEqual(validate_device_type("openvino:cpu"), "openvino:cpu")
-        self.assertEqual(validate_device_type("openvino_int8:gpu"), "openvino_int8:gpu")
 
     def test_invalid_inputs(self):
         with self.assertRaises(argparse.ArgumentTypeError):
@@ -30,6 +29,10 @@ class TestValidateDeviceType(unittest.TestCase):
             validate_device_type("openvino_int8_async")
         with self.assertRaises(argparse.ArgumentTypeError):
             validate_device_type("openvino_async")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            validate_device_type("openvino:gpu")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            validate_device_type("openvino_int8:gpu")
 
 
 if __name__ == "__main__":

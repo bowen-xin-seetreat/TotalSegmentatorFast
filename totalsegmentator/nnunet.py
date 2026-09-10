@@ -373,16 +373,8 @@ class OpenVINOnnUNetPredictor(nnUNetPredictor):
 
     @torch.inference_mode()
     def _infer(self, x: torch.Tensor):
-        """Run one patch through the compiled OpenVINO model.
-
-        Create a fresh infer request for each patch so a shared predictor object
-        can be used safely from multiple threads without racing on an InferRequest
-        that is already busy from another call.
-        """
-        infer_request = self.ov_compiled_model.create_infer_request()
-        infer_request.start_async(x)
-        infer_request.wait()
-        return infer_request.get_output_tensor(0).data
+        """Run one patch through the compiled OpenVINO model."""
+        return self.ov_compiled_model(x)[0].data
 
     @torch.inference_mode()
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
@@ -425,10 +417,7 @@ def nnUNetv2_predict(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
 
     is_openvino = isinstance(device, str) and device.startswith("openvino")
     # Device strings look like "openvino[_int8][:cpu]". The "int8" flag
-    # selects the NNCF-quantized IR (cached separately as .openvino_int8.xml);
-    # the async variant is intentionally omitted to keep this in line with the
-    # upstream TotalSegmentator API and the fact that the sliding-window loop
-    # executes one patch at a time and does not benefit from async pipelining.
+    # selects the NNCF-quantized IR (cached separately as .openvino_int8.xml).
     ov_device = "CPU"
     ov_quantize = False
     if is_openvino:
@@ -437,8 +426,8 @@ def nnUNetv2_predict(dir_in, dir_out, task_id, model="3d_fullres", folds=None,
             device_body, ov_device_suffix = device_body.split(":", 1)
             ov_device = ov_device_suffix.upper()
         ov_flags = device_body[len("openvino"):].strip("_").split("_") if device_body != "openvino" else []
-        if "async" in ov_flags:
-            raise ValueError("Async OpenVINO device strings are not supported; use 'openvino' or 'openvino_int8'.")
+        if any(flag not in ("", "int8") for flag in ov_flags):
+            raise ValueError(f"Invalid OpenVINO device string: {device}. Use 'openvino' or 'openvino_int8'.")
         ov_quantize = "int8" in ov_flags
         import multiprocessing
         torch.set_num_threads(multiprocessing.cpu_count())

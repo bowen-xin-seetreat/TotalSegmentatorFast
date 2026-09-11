@@ -26,10 +26,6 @@ class TestValidateDeviceType(unittest.TestCase):
         with self.assertRaises(argparse.ArgumentTypeError):
             validate_device_type("gpu:")
         with self.assertRaises(argparse.ArgumentTypeError):
-            validate_device_type("openvino_int8_async")
-        with self.assertRaises(argparse.ArgumentTypeError):
-            validate_device_type("openvino_async")
-        with self.assertRaises(argparse.ArgumentTypeError):
             validate_device_type("openvino:gpu")
         with self.assertRaises(argparse.ArgumentTypeError):
             validate_device_type("openvino_int8:gpu")

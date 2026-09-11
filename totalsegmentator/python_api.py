@@ -40,9 +40,7 @@ def validate_device_type_api(value):
         return value
 
     # OpenVINO backends: "openvino[_int8][:cpu]". "int8" selects the
-    # NNCF-quantized IR instead of plain FP32; the async variant is intentionally
-    # not supported because the underlying nnUNet predictor performs one patch at
-    # a time and does not benefit from async pipelining.
+    # NNCF-quantized IR instead of plain FP32.
     openvino_pattern = r"^openvino(_int8)?(?::cpu)?$"
     if re.match(openvino_pattern, value):
         return value

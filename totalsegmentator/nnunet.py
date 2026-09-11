@@ -51,12 +51,22 @@ def recursive_find_python_class_custom(folder: str, class_name: str, current_mod
 
 
 if nnunet_find_objects is not None:
-    recursive_find_trainer_class_by_name = nnunet_find_objects.recursive_find_trainer_class_by_name
+    _existing_trainer_lookup = nnunet_find_objects.recursive_find_trainer_class_by_name
+    # If this module has already been monkey-patched once (e.g. re-executed by
+    # IPython's %autoreload after an edit, without the nnunetv2 package itself
+    # being reloaded), the module attribute above is already our own wrapper
+    # from a previous run. Reuse the true original it cached instead of
+    # wrapping the wrapper again, which would otherwise recurse forever.
+    _recursive_find_trainer_class_by_name_orig = getattr(
+        _existing_trainer_lookup, "_totalseg_wrapped_original", _existing_trainer_lookup
+    )
 
     def recursive_find_trainer_class_by_name_custom(trainer_name: str):
         if trainer_name in custom_trainers:
             return custom_trainers[trainer_name]
-        return recursive_find_trainer_class_by_name(trainer_name)
+        return _recursive_find_trainer_class_by_name_orig(trainer_name)
+
+    recursive_find_trainer_class_by_name_custom._totalseg_wrapped_original = _recursive_find_trainer_class_by_name_orig
 
     nnunet_find_objects.recursive_find_trainer_class_by_name = recursive_find_trainer_class_by_name_custom
     nnunet_predict_from_raw_data.recursive_find_trainer_class_by_name = recursive_find_trainer_class_by_name_custom
@@ -373,8 +383,16 @@ class OpenVINOnnUNetPredictor(nnUNetPredictor):
 
     @torch.inference_mode()
     def _infer(self, x: torch.Tensor):
-        """Run one patch through the compiled OpenVINO model."""
-        return self.ov_compiled_model(x)[0].data
+        """Run one patch through the compiled OpenVINO model.
+
+        Create a fresh infer request for each patch so a shared predictor object
+        (e.g. two segmentations run concurrently from separate threads, both
+        using the same cached compiled model) can't race on a single implicit
+        default InferRequest and hit "Infer Request is busy" errors.
+        """
+        infer_request = self.ov_compiled_model.create_infer_request()
+        infer_request.infer(x)
+        return np.asarray(infer_request.get_output_tensor(0).data)
 
     @torch.inference_mode()
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
